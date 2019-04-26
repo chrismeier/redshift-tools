@@ -1,12 +1,9 @@
 #!/usr/bin/env python
-import os
 import argparse
 import psycopg2
+import os
 
 def setup_views(cur, conn):
-  """
-  SQL sourced from: https://github.com/awslabs/amazon-redshift-utils/blob/master/src/AdminViews/v_generate_user_grant_revoke_ddl.sql
-  """
   generate_permissions_view_sql = """CREATE OR REPLACE VIEW admin.v_generate_user_grant_revoke_ddl AS
   WITH objprivs AS (
     SELECT objowner,
@@ -168,38 +165,101 @@ def setup_views(cur, conn):
       'default acl'::text AS objtype,  pg_get_userbyid(b.defacluser)::text AS grantor, null::text AS grantee, 'revoke'::text AS ddltype, 5 as grantseq, 5 AS objseq,
     'ALTER DEFAULT PRIVILEGES for user '||QUOTE_IDENT(pg_get_userbyid(b.defacluser))||' GRANT ALL on '||decode(b.defaclobjtype,'r','tables','f','functions')||' TO '||QUOTE_IDENT(pg_get_userbyid(b.defacluser))||
   CASE WHEN b.defaclobjtype = 'f' then ', PUBLIC;' ELSE ';' END::text AS ddl FROM pg_default_acl b where b.defaclnamespace=0;"""
+
   cur.execute(generate_permissions_view_sql)
+  conn.commit() 
+
+  drop_objs_view = """
+  CREATE OR REPLACE VIEW admin.v_find_dropuser_objs as
+  SELECT owner.objtype,
+        owner.objowner,
+        owner.userid,
+        owner.schemaname,
+        owner.objname,
+        owner.ddl
+  FROM (
+  -- Functions owned by the user
+      SELECT 'Function',pgu.usename,pgu.usesysid,nc.nspname,textin (regprocedureout (pproc.oid::regprocedure)),
+      'alter function ' || QUOTE_IDENT(nc.nspname) || '.' ||textin (regprocedureout (pproc.oid::regprocedure)) || ' owner to '
+      FROM pg_proc pproc,pg_user pgu,pg_namespace nc
+  WHERE pproc.pronamespace = nc.oid
+  AND   pproc.proowner = pgu.usesysid
+  UNION ALL
+  -- Databases owned by the user
+  SELECT 'Database',
+        pgu.usename,
+        pgu.usesysid,
+        NULL,
+        pgd.datname,
+        'alter database ' || QUOTE_IDENT(pgd.datname) || ' owner to '
+  FROM pg_database pgd,
+      pg_user pgu
+  WHERE pgd.datdba = pgu.usesysid
+  UNION ALL
+  -- Schemas owned by the user
+  SELECT 'Schema',
+        pgu.usename,
+        pgu.usesysid,
+        NULL,
+        pgn.nspname,
+        'alter schema '|| QUOTE_IDENT(pgn.nspname) ||' owner to '
+  FROM pg_namespace pgn,
+      pg_user pgu
+  WHERE pgn.nspowner = pgu.usesysid
+  UNION ALL
+  -- Tables or Views owned by the user
+  SELECT decode(pgc.relkind,
+              'r','Table',
+              'v','View'
+        ) ,
+        pgu.usename,
+        pgu.usesysid,
+        nc.nspname,
+        pgc.relname,
+        'alter table ' || QUOTE_IDENT(nc.nspname) || '.' || QUOTE_IDENT(pgc.relname) || ' owner to '
+  FROM pg_class pgc,
+      pg_user pgu,
+      pg_namespace nc
+  WHERE pgc.relnamespace = nc.oid
+  AND   pgc.relkind IN ('r','v')
+  AND   pgu.usesysid = pgc.relowner
+  AND   nc.nspname NOT ILIKE 'pg\_temp\_%'
+  UNION ALL
+  -- Python libraries owned by the user
+  SELECT 'Library',
+        pgu.usename,
+        pgu.usesysid,
+        '',
+        pgl.name,
+        'No DDL avaible for Python Library. You should DROP OR REPLACE the Python Library'
+  FROM  pg_library pgl,
+        pg_user pgu
+  WHERE pgl.owner = pgu.usesysid) OWNER ("objtype","objowner","userid","schemaname","objname","ddl")
+  WHERE owner.userid > 1;
+  """
+  cur.execute(drop_objs_view)
   conn.commit()
 
-def drop_users_from_group_sql(cur, group):
-  cur.execute(f"SELECT grolist from pg_group where groname = '{group}';")
-  rows = cur.fetchone()
-  if not rows or not rows[0]:
-    return "select 1;"
-  group_member_ids = str(rows[0])[1:-1]
-  sql = f"SELECT usename from pg_user WHERE usesysid in ({group_member_ids})"
-  cur.execute(sql)
-  rows = cur.fetchall()
-  group_member_names = str([name[0] for name in rows])[1:-1].replace('\'', '')
-  alter_group_sql = f"ALTER GROUP {GROUP} DROP USER {group_member_names};"
-  return alter_group_sql
 
-def revoke_all_for_group_sql(cur, group):
-  cur.execute("select distinct schemaname from pg_tables where schemaname not like 'pg_temp%';")
-  rows = cur.fetchall()
-  all_schema_names = str([name[0] for name in rows])[1:-1].replace('\'', '')
-  
+def revoke_all_for_user_sql(cur, user, conn_user):
   revokes = [] 
-  revokes.append(f"REVOKE ALL ON SCHEMA {all_schema_names} FROM GROUP {group};")
-  revokes.append(f"REVOKE ALL ON ALL TABLES IN SCHEMA {all_schema_names} FROM GROUP {group};")
-  cur.execute(f"select ddl from admin.v_generate_user_grant_revoke_ddl where grantee = 'group {group}' and ddl like '%REVOKE%';")
+  cur.execute(f"select ddl from admin.v_generate_user_grant_revoke_ddl where grantee = '{user}' and ddl like '%REVOKE%';")
   rows = cur.fetchall()
   if rows:
     revokes = revokes + [revoke[0] for revoke in rows]
+  cur.execute(f"select ddl from admin.v_find_dropuser_objs where objowner = '{user}' ;")
+  rows = cur.fetchall()
+  if rows:
+    for revoke in rows:
+      if 'No DDL avaible' not in revoke[0]:
+        revokes.append(revoke[0] + ' ' + conn_user + ';')
+      else:
+        print(revoke[0])
   return revokes
 
+
 if __name__ == '__main__':
-  parser = argparse.ArgumentParser(description='''This script removes all users from group, revokes all privileges, and finally drops specified Redshift group.
+  parser = argparse.ArgumentParser(description='''This script removes privileges on objects, transfers ownership to connection user, and finally drops specified user.
                                                   
                                                   Before use, export the following vars:
                                                     export RS_CONN_USER=[yourPrivilegedUser]
@@ -209,18 +269,16 @@ if __name__ == '__main__':
   parser.add_argument('--host', required=True, help='the host for connection')
   parser.add_argument('--port', help='the port database for connection', required=True)
   parser.add_argument('--db', help='the database for connection', required=True)
-  parser.add_argument('--group', help='the group to be dropped', required=True)
+  parser.add_argument('--user_to_drop', help='the Redshift user to be dropped', required=True)
   args = parser.parse_args()
   args_dict = vars(args)
 
   conn = psycopg2.connect(f"dbname='{args_dict['db']}' user='{os.environ.get('RS_CONN_USER')}' host='{args_dict['host']}' password='{os.environ.get('RS_CONN_PASSWORD')}' port={args_dict['port']}")
   cur = conn.cursor()
 
-  setup_views(cur, conn)
   sql_statements = []
-  sql_statements.append(drop_users_from_group_sql(cur, args_dict['group']))
-  sql_statements = sql_statements + revoke_all_for_group_sql(cur, args_dict['group'])
-  sql_statements.append(f"DROP GROUP {args_dict['group']};")
-
+  sql_statements = revoke_all_for_user_sql(cur, args_dict['user_to_drop'], os.environ.get('RS_CONN_USER'))
+  sql_statements.append(f"DROP USER {args_dict['user_to_drop']};")
+  sql_statements = [i for i in sql_statements if i]
   [print("\n", sql) for sql in sql_statements]
   [(cur.execute(sql), conn.commit()) for sql in sql_statements]
